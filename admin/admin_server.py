@@ -4,9 +4,11 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +21,7 @@ CONFIG_DIR = Path(os.environ.get("TRENDRADAR_CONFIG_DIR", str(BASE_DIR / "config
 OUTPUT_DIR = Path(os.environ.get("TRENDRADAR_OUTPUT_DIR", str(BASE_DIR / "output")))
 DOCS_DIR = Path(os.environ.get("TRENDRADAR_DOCS_DIR", str(BASE_DIR / "docs")))
 ADMIN_DIR = Path(os.environ.get("TRENDRADAR_ADMIN_DIR", str(BASE_DIR / "admin")))
+VENDOR_DIR = ADMIN_DIR / "vendor"
 BACKUP_DIR = CONFIG_DIR / "backups"
 ADMIN_TOKEN = os.environ.get("TRENDRADAR_ADMIN_TOKEN", "").strip()
 if not ADMIN_TOKEN and os.environ.get("TRENDRADAR_ADMIN_TOKEN_FILE"):
@@ -26,6 +29,19 @@ if not ADMIN_TOKEN and os.environ.get("TRENDRADAR_ADMIN_TOKEN_FILE"):
         ADMIN_TOKEN = Path(os.environ["TRENDRADAR_ADMIN_TOKEN_FILE"]).read_text(encoding="utf-8").strip()
     except OSError:
         ADMIN_TOKEN = ""
+RUN_ENABLED = os.environ.get("TRENDRADAR_ADMIN_ENABLE_RUN", "0").strip().lower() in ("1", "true", "yes")
+# Host 白名单用于防御 DNS rebinding；通过局域网或反向代理访问时需加入对应主机名
+ALLOWED_HOSTS = {
+    host.strip().lower()
+    for host in os.environ.get("TRENDRADAR_ADMIN_ALLOWED_HOSTS", "127.0.0.1,localhost,[::1]").split(",")
+    if host.strip()
+}
+SESSION_TTL = int(os.environ.get("TRENDRADAR_ADMIN_SESSION_TTL", "43200"))
+SESSION_COOKIE = "tr_admin_session"
+MAX_BODY_BYTES = 2 * 1024 * 1024
+LOGIN_FAILURE_DELAY = 1.0
+SESSIONS = {}
+SESSIONS_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()
 RUN_STATE = {"running": False, "started_at": None, "finished_at": None, "exit_code": None, "log": ""}
 
@@ -37,6 +53,32 @@ TEXT_FILES = {
     "ai_analysis_prompt": {"path": CONFIG_DIR / "ai_analysis_prompt.txt", "label": "AI 分析提示词", "kind": "text"},
     "ai_translation_prompt": {"path": CONFIG_DIR / "ai_translation_prompt.txt", "label": "AI 翻译提示词", "kind": "text"},
 }
+
+# 官方编辑器引用的 CDN 资源改由本地 vendor/ 提供（来源与校验见 admin/vendor/SOURCES.md），
+# 这样第三方脚本无法在管理页面的同源上下文中运行
+CDN_REWRITES = (
+    ('"https://cdn.tailwindcss.com"', '"/vendor/tailwindcss-play-3.4.17.js"'),
+    ('"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"', '"/vendor/fontawesome/css/all.min.css"'),
+    ('"https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"', '"/vendor/js-yaml-4.1.0.min.js"'),
+    ('"https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"', '"/vendor/Sortable-1.15.0.min.js"'),
+)
+EXTERNAL_RESOURCE_RE = re.compile(r'<(?:script|link)\b[^>]*(?:src|href)="(https?://[^"]+)"', re.IGNORECASE)
+# 服务器模式下无意义或有风险的官方按钮：加载官网配置会覆盖编辑器内容
+OFFICIAL_BUTTON_RE = re.compile(r'<button\b[^>]*onclick="(?:openLoadConfigModal|copyResult)\(\)"[^>]*>.*?</button>\s*', re.DOTALL)
+QUERY_RE = re.compile(r"\?[^\s\"]*")
+
+EDITOR_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+LOGIN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+
+
+class RequestError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
 
 def now_iso():
@@ -104,7 +146,7 @@ def latest_report():
     candidates = [OUTPUT_DIR / "html" / "latest" / "current.html", OUTPUT_DIR / "index.html"]
     for path in candidates:
         if path.exists():
-            return {"path": str(path), "mtime": path.stat().st_mtime, "size": path.stat().st_size}
+            return {"mtime": path.stat().st_mtime, "size": path.stat().st_size}
     return None
 
 
@@ -115,13 +157,14 @@ def service_urls(handler):
     web_url = os.environ.get("TRENDRADAR_WEB_PUBLIC_URL", "").strip()
     if not web_url:
         web_port = os.environ.get("TRENDRADAR_WEB_PORT", "8080")
-        hostname = host
-        if host.startswith("[") and "]" in host:
-            hostname = host[:host.index("]") + 1]
-        elif ":" in host:
-            hostname = host.split(":", 1)[0]
-        web_url = f"{scheme}://{hostname}:{web_port}/"
+        web_url = f"{scheme}://{split_hostname(host)}:{web_port}/"
     return {"web": web_url.rstrip("/") + "/", "admin": admin_url.rstrip("/") + "/"}
+
+
+def split_hostname(host: str) -> str:
+    if host.startswith("[") and "]" in host:
+        return host[:host.index("]") + 1]
+    return host.split(":", 1)[0]
 
 
 def list_backups():
@@ -149,6 +192,8 @@ def content_type_for(path: Path):
         if guess.startswith("text/") or guess in ("application/javascript", "application/json"):
             return guess + "; charset=utf-8"
         return guess
+    if path.suffix == ".woff2":
+        return "font/woff2"
     return "application/octet-stream"
 
 
@@ -158,37 +203,17 @@ def official_editor_html():
         return "<!doctype html><meta charset=\"utf-8\"><title>TrendRadar Admin</title><p>官方配置编辑器文件不存在，请检查 /app/docs/index.html。</p>"
     html = index_path.read_text(encoding="utf-8")
     html = html.replace("纯静态页面，数据仅保存在你的本地浏览器，请放心使用", "服务器增强模式：配置保存到当前 TrendRadar 部署")
+    for remote, local in CDN_REWRITES:
+        html = html.replace(remote, local)
+    remaining = EXTERNAL_RESOURCE_RE.findall(html)
+    if remaining:
+        # CSP 会拦截这些资源；通常是官方编辑器升级了依赖版本，需要同步更新 vendor/
+        print("WARNING: editor still references external resources blocked by CSP: " + ", ".join(remaining), flush=True)
     bridge = '    <script src="/admin-bridge.js"></script>\n'
     if "/admin-bridge.js" not in html:
         html = html.replace("</body>", bridge + "</body>")
-    html = remove_official_header_actions(html)
+    html = OFFICIAL_BUTTON_RE.sub("", html)
     return remove_support_sidebar(html)
-
-
-def remove_official_header_actions(html: str) -> str:
-    marker = '<div class="flex gap-3">'
-    search_from = 0
-    while True:
-        start = html.find(marker, search_from)
-        if start < 0:
-            return html
-
-        tag_pattern = re.compile(r"</?div\b[^>]*>", re.IGNORECASE)
-        depth = 0
-        for match in tag_pattern.finditer(html, start):
-            tag = match.group(0)
-            if tag.startswith("</"):
-                depth -= 1
-                if depth == 0:
-                    block = html[start:match.end()]
-                    if "加载官网最新配置" in block and "复制配置" in block:
-                        return html[:start] + html[match.end():]
-                    search_from = match.end()
-                    break
-            else:
-                depth += 1
-        else:
-            return html
 
 
 def remove_support_sidebar(html: str) -> str:
@@ -208,6 +233,40 @@ def remove_support_sidebar(html: str) -> str:
         else:
             depth += 1
     return html
+
+
+def create_session():
+    sid = secrets.token_urlsafe(32)
+    now = time.time()
+    with SESSIONS_LOCK:
+        for key in [key for key, expiry in SESSIONS.items() if expiry < now]:
+            del SESSIONS[key]
+        SESSIONS[sid] = now + SESSION_TTL
+    return sid
+
+
+def session_valid(sid: str) -> bool:
+    if not sid:
+        return False
+    with SESSIONS_LOCK:
+        expiry = SESSIONS.get(sid)
+        if expiry is None:
+            return False
+        if expiry < time.time():
+            del SESSIONS[sid]
+            return False
+        return True
+
+
+def drop_session(sid: str):
+    with SESSIONS_LOCK:
+        SESSIONS.pop(sid, None)
+
+
+def token_matches(candidate: str) -> bool:
+    if not ADMIN_TOKEN:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8", "replace"), ADMIN_TOKEN.encode("utf-8"))
 
 
 def run_crawl_background():
@@ -242,79 +301,55 @@ def run_crawl_background():
     return True
 
 
-HTML_PAGE = r'''<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TrendRadar Admin</title>
-<style>
-:root{--bg:#f6f7fb;--card:#fff;--line:#e5e7eb;--text:#111827;--muted:#6b7280;--brand:#4f46e5;--ok:#059669;--bad:#dc2626}*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text)}header{padding:24px 28px;background:linear-gradient(135deg,#312e81,#7c3aed);color:white}header h1{margin:0 0 6px;font-size:26px}header p{margin:0;color:#ddd6fe}main{max-width:1260px;margin:0 auto;padding:22px}.grid{display:grid;grid-template-columns:250px 1fr;gap:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 28px rgba(15,23,42,.05)}nav{padding:10px}.tab{display:block;width:100%;border:0;background:transparent;text-align:left;padding:12px 14px;border-radius:12px;cursor:pointer;color:#374151;font-size:14px}.tab:hover,.tab.active{background:#eef2ff;color:#3730a3;font-weight:700}.section{display:none;padding:20px}.section.active{display:block}h2{margin:0 0 16px;font-size:20px}h3{margin:22px 0 10px}.muted{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:190px 1fr;gap:12px;align-items:center;margin:10px 0}.row label{font-size:14px;color:#374151}.row input,.row select,.row textarea{width:100%;border:1px solid var(--line);border-radius:10px;padding:10px;font-size:14px;background:white}.btn{border:0;border-radius:10px;padding:10px 14px;background:#e5e7eb;cursor:pointer;font-weight:700;text-decoration:none;color:#111827;display:inline-block}.btn.primary{background:var(--brand);color:white}.btn.ok{background:var(--ok);color:white}.btn.bad{background:var(--bad);color:white}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}textarea.editor{width:100%;min-height:520px;border:1px solid var(--line);border-radius:12px;padding:12px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px;line-height:1.45}.pill{display:inline-flex;padding:4px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;margin:2px}.status{white-space:pre-wrap;background:#0f172a;color:#e5e7eb;padding:14px;border-radius:12px;max-height:440px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px}.toast{position:fixed;right:20px;bottom:20px;background:#111827;color:white;padding:12px 16px;border-radius:12px;display:none;box-shadow:0 10px 30px rgba(0,0,0,.25)}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--line);padding:10px;text-align:left;font-size:13px}.table input{width:100%;border:1px solid var(--line);border-radius:8px;padding:8px}.hint{padding:12px;border-radius:12px;background:#f8fafc;border:1px solid var(--line);color:#475569}@media(max-width:820px){.grid{grid-template-columns:1fr}.row{grid-template-columns:1fr}}
-</style>
-</head>
-<body><header><h1>TrendRadar Admin</h1><p>保存配置会校验、备份、原子写入；下一次定时采集自动生效，也可点击立即运行。</p></header><main><div class="grid"><nav class="card" id="nav"></nav><div class="card">
-<section id="dashboard" class="section active"><h2>状态总览</h2><div id="summary" class="hint">加载中...</div><div class="actions"><button class="btn primary" onclick="runNow()">立即运行一次</button><a class="btn" href="/report" target="_blank">打开最新报告</a><button class="btn" onclick="loadAll()">刷新</button></div><h3>运行日志</h3><pre id="runlog" class="status">暂无</pre></section>
-<section id="basic" class="section"><h2>基础设置</h2><div id="basicForm"></div><div class="actions"><button class="btn primary" onclick="saveBasic()">保存基础设置</button></div></section>
-<section id="platforms" class="section"><h2>热榜平台</h2><div class="hint">来自 config.yaml 的 platforms.sources；保存后下一次采集生效。</div><div id="platformList"></div><div class="actions"><button class="btn primary" onclick="savePlatforms()">保存平台设置</button></div></section>
-<section id="rss" class="section"><h2>RSS 订阅</h2><div class="row"><label>启用 RSS</label><input id="rss_enabled" type="checkbox"></div><div class="row"><label>新鲜度过滤/天</label><input id="rss_max_age_days" type="number" min="0"></div><table class="table"><thead><tr><th>启用</th><th>ID</th><th>名称</th><th>URL</th><th></th></tr></thead><tbody id="rssRows"></tbody></table><div class="actions"><button class="btn" onclick="addRssRow()">添加 RSS</button><button class="btn primary" onclick="saveRss()">保存 RSS</button></div></section>
-<section id="keywords" class="section"><h2>关键词配置</h2><textarea id="frequencyText" class="editor"></textarea><div class="actions"><button class="btn primary" onclick="saveTextFile('frequency')">保存关键词</button></div></section>
-<section id="ai" class="section"><h2>AI 设置</h2><div id="aiForm"></div><h3>AI 兴趣描述</h3><textarea id="aiInterests" class="editor" style="min-height:220px"></textarea><div class="actions"><button class="btn primary" onclick="saveAi()">保存 AI 设置</button></div></section>
-<section id="notify" class="section"><h2>通知渠道</h2><div class="hint">密码/Token 输入框留空表示不覆盖现有值。</div><div id="notifyForm"></div><div class="actions"><button class="btn primary" onclick="saveNotify()">保存通知设置</button></div></section>
-<section id="timeline" class="section"><h2>时间线 timeline.yaml</h2><textarea id="timelineText" class="editor"></textarea><div class="actions"><button class="btn primary" onclick="saveTextFile('timeline')">保存时间线</button></div></section>
-<section id="prompts" class="section"><h2>提示词文件</h2><h3>AI 分析提示词</h3><textarea id="aiAnalysisPrompt" class="editor" style="min-height:220px"></textarea><h3>AI 翻译提示词</h3><textarea id="aiTranslationPrompt" class="editor" style="min-height:220px"></textarea><div class="actions"><button class="btn primary" onclick="saveTextFile('ai_analysis_prompt');saveTextFile('ai_translation_prompt')">保存提示词</button></div></section>
-<section id="raw" class="section"><h2>原始 config.yaml</h2><textarea id="configText" class="editor"></textarea><div class="actions"><button class="btn primary" onclick="saveTextFile('config')">保存 config.yaml</button><button class="btn" onclick="validateRaw()">校验</button></div></section>
-<section id="backups" class="section"><h2>备份与回滚</h2><div id="backupList"></div></section>
-</div></div></main><div id="toast" class="toast"></div>
-<script>
-const tabs=[['dashboard','状态'],['basic','基础设置'],['platforms','热榜平台'],['rss','RSS'],['keywords','关键词'],['ai','AI'],['notify','通知'],['timeline','时间线'],['prompts','提示词'],['raw','原始配置'],['backups','备份']];let state={};
-function toast(msg){const el=document.getElementById('toast');el.textContent=msg;el.style.display='block';setTimeout(()=>el.style.display='none',3600)}
-async function api(path,opts={}){const r=await fetch('/api'+path,{headers:{'Content-Type':'application/json'},...opts});const t=await r.text();let j;try{j=JSON.parse(t)}catch{j={success:false,error:t}}if(!r.ok||j.success===false)throw new Error(j.error||j.message||r.statusText);return j}
-function initNav(){nav.innerHTML=tabs.map(([id,n])=>`<button class="tab ${id==='dashboard'?'active':''}" onclick="showTab('${id}',this)">${n}</button>`).join('')}
-function showTab(id,btn){document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));btn.classList.add('active');if(id==='backups')loadBackups()}
-function val(id){const el=document.getElementById(id);return el.type==='checkbox'?el.checked:el.value}function setv(id,v){const el=document.getElementById(id);if(!el)return;if(el.type==='checkbox')el.checked=!!v;else el.value=v??''}function get(obj,path,d=''){const v=path.split('.').reduce((a,k)=>a&&a[k]!==undefined?a[k]:undefined,obj);return v===undefined?d:v}function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function field(id,label,type='text'){return `<div class="row"><label>${label}</label><input id="${id}" type="${type}"></div>`}
-async function loadAll(){try{state=await api('/state');renderAll();toast('已加载')}catch(e){toast(e.message)}}
-function renderAll(){const c=state.config||{};summary.innerHTML=`<b>Web:</b> <a href="${state.service.web}" target="_blank">${state.service.web}</a><br><b>Admin:</b> ${state.service.admin}<br><b>最新报告:</b> ${state.report?new Date(state.report.mtime*1000).toLocaleString():'无'}<br><b>配置文件:</b> ${(state.files||[]).map(f=>`<span class="pill">${f.label}</span>`).join('')}`;configText.value=state.texts.config||'';frequencyText.value=state.texts.frequency||'';timelineText.value=state.texts.timeline||'';aiInterests.value=state.texts.ai_interests||'';aiAnalysisPrompt.value=state.texts.ai_analysis_prompt||'';aiTranslationPrompt.value=state.texts.ai_translation_prompt||'';renderBasic(c);renderPlatforms(c);renderRss(c);renderAi(c);renderNotify();loadStatus()}
-function renderBasic(c){basicForm.innerHTML=field('app_timezone','时区')+field('report_mode','报告模式 current/daily')+field('schedule_enabled','启用时间线调度','checkbox')+field('schedule_preset','调度 preset')+field('filter_method','筛选方式 keyword/ai')+field('rank_threshold','排名阈值','number')+field('max_news_per_keyword','每关键词最大条数','number')+field('notification_enabled','启用通知','checkbox');setv('app_timezone',get(c,'app.timezone','Asia/Shanghai'));setv('report_mode',get(c,'report.mode','current'));setv('schedule_enabled',get(c,'schedule.enabled',false));setv('schedule_preset',get(c,'schedule.preset','always_on'));setv('filter_method',get(c,'filter.method','keyword'));setv('rank_threshold',get(c,'report.rank_threshold',10));setv('max_news_per_keyword',get(c,'report.max_news_per_keyword',0));setv('notification_enabled',get(c,'notification.enabled',true))}
-function renderPlatforms(c){const arr=get(c,'platforms.sources',[]);platformList.innerHTML=arr.map((p,i)=>`<div class="row"><label><input type="checkbox" id="pf_en_${i}" ${p.enabled!==false?'checked':''}> ${esc(p.id)}</label><input id="pf_name_${i}" value="${esc(p.name||'')}"><input type="hidden" id="pf_id_${i}" value="${esc(p.id)}"><input type="hidden" id="pf_domain_${i}" value="${esc(p.expected_domain||'')}"></div>`).join('')}
-function renderRss(c){setv('rss_enabled',get(c,'rss.enabled',false));setv('rss_max_age_days',get(c,'rss.freshness_filter.max_age_days',3));rssRows.innerHTML='';(get(c,'rss.feeds',[])||[]).forEach(addRssRow)}
-function addRssRow(feed={}){const i=rssRows.children.length;rssRows.insertAdjacentHTML('beforeend',`<tr><td><input type="checkbox" id="rss_en_${i}" ${feed.enabled!==false?'checked':''}></td><td><input id="rss_id_${i}" value="${esc(feed.id||'')}"></td><td><input id="rss_name_${i}" value="${esc(feed.name||'')}"></td><td><input id="rss_url_${i}" value="${esc(feed.url||'')}"></td><td><button class="btn bad" onclick="this.closest('tr').remove()">删</button></td></tr>`)}
-function renderAi(c){aiForm.innerHTML=field('ai_filter_min_score','AI 筛选最低分','number')+field('ai_batch_size','AI 批量大小','number')+field('ai_analysis_enabled','启用 AI 分析','checkbox')+field('ai_translation_enabled','启用 AI 翻译','checkbox')+field('ai_translation_target','翻译目标语言')+field('ai_api_base','AI API Base')+field('ai_model','AI 模型')+field('ai_api_key','AI API Key','password');setv('ai_filter_min_score',get(c,'ai_filter.min_score',0.7));setv('ai_batch_size',get(c,'ai_filter.batch_size',200));setv('ai_analysis_enabled',get(c,'ai_analysis.enabled',false));setv('ai_translation_enabled',get(c,'ai_translation.enabled',false));setv('ai_translation_target',get(c,'ai_translation.target_language','中文'));setv('ai_api_base',get(c,'ai.api_base',''));setv('ai_model',get(c,'ai.model',''));setv('ai_api_key','')}
-function renderNotify(){notifyForm.innerHTML=field('feishu_webhook','飞书 Webhook','password')+field('telegram_bot_token','Telegram Bot Token','password')+field('telegram_chat_id','Telegram Chat ID')+field('dingtalk_webhook','钉钉 Webhook','password')+field('wework_webhook','企业微信 Webhook','password')+field('email_from','发件邮箱')+field('email_password','邮箱密码','password')+field('email_to','收件邮箱')+field('ntfy_topic','ntfy Topic')+field('bark_url','Bark URL','password')+field('slack_webhook','Slack Webhook','password')+field('generic_webhook','通用 Webhook','password')}
-async function saveTextFile(key){const ids={config:'configText',frequency:'frequencyText',timeline:'timelineText',ai_interests:'aiInterests',ai_analysis_prompt:'aiAnalysisPrompt',ai_translation_prompt:'aiTranslationPrompt'};try{await api('/file/'+key,{method:'POST',body:JSON.stringify({content:document.getElementById(ids[key]).value})});toast('已保存并备份 '+key);await loadAll()}catch(e){toast(e.message)}}
-async function savePatch(patch){await api('/config/patch',{method:'POST',body:JSON.stringify({patch})});toast('已保存配置');await loadAll()}
-function saveBasic(){savePatch({'app.timezone':val('app_timezone'),'report.mode':val('report_mode'),'schedule.enabled':val('schedule_enabled'),'schedule.preset':val('schedule_preset'),'filter.method':val('filter_method'),'report.rank_threshold':Number(val('rank_threshold')),'report.max_news_per_keyword':Number(val('max_news_per_keyword')),'notification.enabled':val('notification_enabled')})}
-function savePlatforms(){const sources=[];document.querySelectorAll('[id^=pf_id_]').forEach((el,i)=>sources.push({id:el.value,name:val('pf_name_'+i),expected_domain:val('pf_domain_'+i),enabled:val('pf_en_'+i)}));savePatch({'platforms.sources':sources})}
-function saveRss(){const feeds=[];[...rssRows.children].forEach((tr,i)=>{const id=val('rss_id_'+i),url=val('rss_url_'+i);if(id&&url)feeds.push({id,name:val('rss_name_'+i),url,enabled:val('rss_en_'+i)})});savePatch({'rss.enabled':val('rss_enabled'),'rss.freshness_filter.max_age_days':Number(val('rss_max_age_days')),'rss.feeds':feeds})}
-async function saveAi(){const patch={'ai_filter.min_score':Number(val('ai_filter_min_score')),'ai_filter.batch_size':Number(val('ai_batch_size')),'ai_analysis.enabled':val('ai_analysis_enabled'),'ai_translation.enabled':val('ai_translation_enabled'),'ai_translation.target_language':val('ai_translation_target'),'ai.api_base':val('ai_api_base'),'ai.model':val('ai_model')};if(val('ai_api_key'))patch['ai.api_key']=val('ai_api_key');await savePatch(patch);await saveTextFile('ai_interests')}
-function saveNotify(){const p={};[['notification.feishu.webhook_url','feishu_webhook'],['notification.telegram.bot_token','telegram_bot_token'],['notification.telegram.chat_id','telegram_chat_id'],['notification.dingtalk.webhook_url','dingtalk_webhook'],['notification.wework.webhook_url','wework_webhook'],['notification.email.from','email_from'],['notification.email.password','email_password'],['notification.email.to','email_to'],['notification.ntfy.topic','ntfy_topic'],['notification.bark.url','bark_url'],['notification.slack.webhook_url','slack_webhook'],['notification.generic_webhook.url','generic_webhook']].forEach(([k,id])=>{if(val(id))p[k]=val(id)});savePatch(p)}
-async function validateRaw(){try{await api('/validate',{method:'POST',body:JSON.stringify({file:'config',content:configText.value})});toast('校验通过')}catch(e){toast(e.message)}}
-async function runNow(){try{await api('/run',{method:'POST',body:'{}'});toast('已开始运行');setTimeout(loadStatus,1500)}catch(e){toast(e.message)}}
-async function loadStatus(){try{const s=await api('/run');runlog.textContent=(s.running?'运行中...\n':'')+(s.log||'暂无手动运行日志')}catch(e){runlog.textContent=e.message}}
-async function loadBackups(){try{const b=await api('/backups');backupList.innerHTML='<table class="table"><tr><th>文件</th><th>大小</th><th>时间</th><th></th></tr>'+b.items.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.size}</td><td>${new Date(x.mtime*1000).toLocaleString()}</td><td><button class="btn" onclick="restoreBackup('${esc(x.name)}')">回滚</button></td></tr>`).join('')+'</table>'}catch(e){toast(e.message)}}
-async function restoreBackup(name){if(!confirm('确认回滚 '+name+' ?'))return;try{await api('/backup/restore',{method:'POST',body:JSON.stringify({name})});toast('已回滚');await loadAll();await loadBackups()}catch(e){toast(e.message)}}
-setInterval(loadStatus,5000);initNav();loadAll();
-</script></body></html>'''
-
-LOGIN_PAGE = '''<!doctype html><html><head><meta charset="utf-8"><title>TrendRadar Admin Login</title><style>body{font-family:sans-serif;background:#f6f7fb;display:grid;place-items:center;height:100vh}.box{background:white;padding:28px;border-radius:16px;box-shadow:0 10px 30px #0001}input{padding:10px;border:1px solid #ddd;border-radius:8px;width:280px}button{padding:10px 14px;border:0;border-radius:8px;background:#4f46e5;color:white;font-weight:700}</style></head><body><form class="box" method="GET"><h2>TrendRadar Admin</h2><p>请输入访问 Token</p><input name="token" type="password" autofocus><button>进入</button></form></body></html>'''
+LOGIN_PAGE = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>TrendRadar Admin 登录</title><style>body{font-family:sans-serif;background:#f6f7fb;display:grid;place-items:center;height:100vh;margin:0}.box{background:white;padding:28px;border-radius:16px;box-shadow:0 10px 30px #0001}input{padding:10px;border:1px solid #ddd;border-radius:8px;width:280px}button{padding:10px 14px;border:0;border-radius:8px;background:#4f46e5;color:white;font-weight:700}.error{color:#b91c1c;font-size:14px}</style></head><body><form class="box" method="POST" action="/login"><h2>TrendRadar Admin</h2><label for="token">访问 Token</label><p><input id="token" name="token" type="password" autocomplete="current-password" autofocus required> <button>进入</button></p>{error}</form></body></html>'''
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "TrendRadarAdmin/1.0"
 
     def log_message(self, fmt, *args):
-        print("[%s] %s" % (self.log_date_time_string(), fmt % args), flush=True)
+        # 查询串可能带凭据（例如旧版 ?token= 链接），日志中一律隐去
+        message = QUERY_RE.sub("?<redacted>", fmt % args)
+        print("[%s] %s" % (self.log_date_time_string(), message), flush=True)
 
-    def _token_from_cookie(self):
-        cookie = self.headers.get("Cookie", "")
-        for part in cookie.split(";"):
-            if part.strip().startswith("tr_admin_token="):
-                return part.strip().split("=", 1)[1]
+    def _cookie(self, name):
+        for part in self.headers.get("Cookie", "").split(";"):
+            key, sep, value = part.strip().partition("=")
+            if sep and key == name:
+                return value
         return ""
 
     def _authorized(self):
         if not ADMIN_TOKEN:
             return False
         auth_value = self.headers.get("Authorization", "")
-        return hmac.compare_digest(auth_value, f"Bearer {ADMIN_TOKEN}") or hmac.compare_digest(self._token_from_cookie(), ADMIN_TOKEN)
+        if auth_value.startswith("Bearer ") and token_matches(auth_value[len("Bearer "):]):
+            return True
+        return session_valid(self._cookie(SESSION_COOKIE))
+
+    def _host_allowed(self):
+        if "*" in ALLOWED_HOSTS:
+            return True
+        host = (self.headers.get("Host") or "").strip().lower()
+        return split_hostname(host) in ALLOWED_HOSTS
+
+    def _same_origin(self):
+        # 浏览器把同一 IP 的不同端口视为 same-site，SameSite cookie 挡不住，必须校验来源
+        fetch_site = self.headers.get("Sec-Fetch-Site")
+        if fetch_site is not None:
+            # 现代浏览器自动附带、页面脚本无法伪造；表单导航的 Origin 可能是 null，以此为准
+            return fetch_site in ("same-origin", "none")
+        origin = self.headers.get("Origin")
+        if origin is None:
+            # curl 等非浏览器客户端两者都不带，也拿不到浏览器里的会话 cookie
+            return True
+        host = self.headers.get("Host", "")
+        allowed = {f"http://{host}", f"https://{host}"}
+        public_url = os.environ.get("TRENDRADAR_ADMIN_PUBLIC_URL", "").strip()
+        if public_url:
+            parsed = urlparse(public_url)
+            allowed.add(f"{parsed.scheme}://{parsed.netloc}")
+        return origin in allowed
 
     def _send(self, status=200, body=b"", content_type="application/json; charset=utf-8", extra_headers=None):
         if isinstance(body, str):
@@ -323,64 +358,85 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
         if extra_headers:
             for key, value in extra_headers.items():
                 self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _json(self, data, status=200):
         self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
-    def _body(self):
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
-        return json.loads(raw.decode("utf-8") or "{}")
+    def _text(self, status, message):
+        self._send(status, message, "text/plain; charset=utf-8")
+
+    def _login_page(self, status=200, error=""):
+        body = LOGIN_PAGE.replace("{error}", f'<p class="error" role="alert">{error}</p>' if error else "")
+        self._send(status, body, "text/html; charset=utf-8", {"Content-Security-Policy": LOGIN_CSP})
+
+    def _raw_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            raise RequestError(400, "invalid Content-Length")
+        if length < 0:
+            raise RequestError(400, "invalid Content-Length")
+        if length > MAX_BODY_BYTES:
+            raise RequestError(413, "request body too large")
+        return self.rfile.read(length) if length else b""
+
+    def _json_body(self):
+        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise RequestError(415, "Content-Type must be application/json")
+        raw = self._raw_body()
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise RequestError(400, "invalid JSON body")
+        if not isinstance(data, dict):
+            raise RequestError(400, "JSON body must be an object")
+        return data
 
     def do_HEAD(self):
-        self._send(200, b"", "text/plain; charset=utf-8")
+        self.do_GET()
 
     def do_GET(self):
+        if not self._host_allowed():
+            self._text(403, "host not allowed")
+            return
         parsed = urlparse(self.path)
-        query = parse_qs(parsed.query)
-        if ADMIN_TOKEN and hmac.compare_digest(query.get("token", [""])[0], ADMIN_TOKEN):
-            self._send(302, "", "text/plain", {"Set-Cookie": f"tr_admin_token={ADMIN_TOKEN}; Path=/; SameSite=Lax; HttpOnly", "Location": "/"})
+        if parsed.path == "/favicon.ico":
+            self._send(204, b"", "image/x-icon")
             return
-        if parsed.path == "/" and not self._authorized():
-            self._send(200, LOGIN_PAGE, "text/html; charset=utf-8")
+        authorized = self._authorized()
+        if parsed.path == "/":
+            if authorized:
+                self._send(200, official_editor_html(), "text/html; charset=utf-8", {"Content-Security-Policy": EDITOR_CSP})
+            else:
+                self._login_page()
             return
-        if parsed.path in ("/admin-bridge.js", "/report") and not self._authorized():
-            self._send(200, LOGIN_PAGE, "text/html; charset=utf-8")
-            return
-        if parsed.path.startswith("/assets/") and not self._authorized():
-            self._send(200, LOGIN_PAGE, "text/html; charset=utf-8")
-            return
-        if parsed.path.startswith("/api") and not self._authorized():
-            self._json({"success": False, "error": "unauthorized"}, 401)
+        if not authorized:
+            if parsed.path.startswith("/api"):
+                self._json({"success": False, "error": "unauthorized"}, 401)
+            else:
+                self._text(401, "unauthorized")
             return
         try:
-            if parsed.path == "/":
-                self._send(200, official_editor_html(), "text/html; charset=utf-8")
-            elif parsed.path == "/simple":
-                self._send(404, "simple admin removed", "text/plain; charset=utf-8")
-            elif parsed.path == "/admin-bridge.js":
+            if parsed.path == "/admin-bridge.js":
                 bridge_path = ADMIN_DIR / "admin_bridge.js"
                 if bridge_path.exists():
                     self._send(200, bridge_path.read_bytes(), "application/javascript; charset=utf-8")
                 else:
-                    self._send(404, "admin bridge not found", "text/plain; charset=utf-8")
+                    self._text(404, "admin bridge not found")
             elif parsed.path.startswith("/assets/"):
-                asset = safe_child(DOCS_DIR, parsed.path)
-                if asset and asset.is_file():
-                    self._send(200, asset.read_bytes(), content_type_for(asset))
-                else:
-                    self._send(404, "asset not found", "text/plain; charset=utf-8")
-            elif parsed.path == "/report":
-                report = latest_report()
-                if report and Path(report["path"]).exists():
-                    self._send(200, Path(report["path"]).read_bytes(), "text/html; charset=utf-8")
-                else:
-                    self._send(404, "No report", "text/plain; charset=utf-8")
+                self._static(DOCS_DIR, parsed.path)
+            elif parsed.path.startswith("/vendor/"):
+                self._static(VENDOR_DIR, parsed.path[len("/vendor/"):])
             elif parsed.path == "/api/state":
                 config, _ = load_yaml_file("config")
                 texts = {key: read_text(spec["path"]) for key, spec in TEXT_FILES.items()}
@@ -388,38 +444,97 @@ class Handler(BaseHTTPRequestHandler):
                 for key, spec in TEXT_FILES.items():
                     path = spec["path"]
                     files.append({"key": key, "label": spec["label"], "exists": path.exists(), "mtime": path.stat().st_mtime if path.exists() else None})
-                self._json({"success": True, "config": config, "texts": texts, "files": files, "report": latest_report(), "service": service_urls(self)})
+                self._json({
+                    "success": True,
+                    "config": config,
+                    "texts": texts,
+                    "files": files,
+                    "report": latest_report(),
+                    "service": service_urls(self),
+                    "features": {"run": RUN_ENABLED},
+                })
             elif parsed.path == "/api/run":
-                self._json({"success": True, **RUN_STATE})
+                self._json({"success": True, "enabled": RUN_ENABLED, **RUN_STATE})
             elif parsed.path == "/api/backups":
                 self._json({"success": True, "items": list_backups()})
-            else:
+            elif parsed.path.startswith("/api"):
                 self._json({"success": False, "error": "not found"}, 404)
+            else:
+                self._text(404, "not found")
         except Exception as exc:
             self._json({"success": False, "error": str(exc)}, 500)
 
+    def _static(self, base: Path, request_path: str):
+        asset = safe_child(base, request_path)
+        if asset and asset.is_file():
+            self._send(200, asset.read_bytes(), content_type_for(asset), {"Cache-Control": "private, max-age=3600"})
+        else:
+            self._text(404, "asset not found")
+
     def do_POST(self):
+        if not self._host_allowed():
+            self._text(403, "host not allowed")
+            return
         parsed = urlparse(self.path)
-        if parsed.path.startswith("/api") and not self._authorized():
+        try:
+            if parsed.path == "/login":
+                self._handle_login()
+            elif parsed.path == "/logout":
+                self._handle_logout()
+            elif parsed.path.startswith("/api"):
+                self._handle_api_post(parsed.path)
+            else:
+                self._text(404, "not found")
+        except RequestError as exc:
+            self._json({"success": False, "error": str(exc)}, exc.status)
+
+    def _handle_login(self):
+        if not self._same_origin():
+            self._text(403, "cross-origin request rejected")
+            return
+        form = parse_qs(self._raw_body().decode("utf-8", "replace"))
+        if not token_matches(form.get("token", [""])[0].strip()):
+            time.sleep(LOGIN_FAILURE_DELAY)
+            self._login_page(401, "Token 不正确")
+            return
+        sid = create_session()
+        cookie = f"{SESSION_COOKIE}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict"
+        self._send(303, "", "text/plain; charset=utf-8", {"Set-Cookie": cookie, "Location": "/"})
+
+    def _handle_logout(self):
+        if not self._same_origin():
+            self._text(403, "cross-origin request rejected")
+            return
+        drop_session(self._cookie(SESSION_COOKIE))
+        cookie = f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+        self._send(303, "", "text/plain; charset=utf-8", {"Set-Cookie": cookie, "Location": "/"})
+
+    def _handle_api_post(self, path):
+        if not self._authorized():
             self._json({"success": False, "error": "unauthorized"}, 401)
             return
+        if not self._same_origin():
+            self._json({"success": False, "error": "cross-origin request rejected"}, 403)
+            return
+        data = self._json_body()
         try:
-            data = self._body()
-            if parsed.path.startswith("/api/file/"):
-                key = parsed.path.rsplit("/", 1)[-1]
+            if path.startswith("/api/file/"):
+                key = path.rsplit("/", 1)[-1]
                 if key not in TEXT_FILES:
                     raise ValueError("unknown file")
                 content = data.get("content", "")
                 validate_file(key, content)
-                path = TEXT_FILES[key]["path"]
-                backup = backup_file(path, "save")
-                atomic_write(path, content)
+                file_path = TEXT_FILES[key]["path"]
+                backup = backup_file(file_path, "save")
+                atomic_write(file_path, content)
                 self._json({"success": True, "backup": backup})
-            elif parsed.path == "/api/validate":
+            elif path == "/api/validate":
                 key = data.get("file", "config")
+                if key not in TEXT_FILES:
+                    raise ValueError("unknown file")
                 validate_file(key, data.get("content", ""))
                 self._json({"success": True})
-            elif parsed.path == "/api/config/patch":
+            elif path == "/api/config/patch":
                 config, _ = load_yaml_file("config")
                 for key, value in data.get("patch", {}).items():
                     set_nested(config, key, value)
@@ -428,10 +543,13 @@ class Handler(BaseHTTPRequestHandler):
                 backup = backup_file(TEXT_FILES["config"]["path"], "patch")
                 atomic_write(TEXT_FILES["config"]["path"], content)
                 self._json({"success": True, "backup": backup})
-            elif parsed.path == "/api/run":
+            elif path == "/api/run":
+                if not RUN_ENABLED:
+                    self._json({"success": False, "error": "manual run is disabled (TRENDRADAR_ADMIN_ENABLE_RUN)"}, 403)
+                    return
                 started = run_crawl_background()
                 self._json({"success": True, "started": started, **RUN_STATE})
-            elif parsed.path == "/api/backup/restore":
+            elif path == "/api/backup/restore":
                 name = Path(data.get("name", "")).name
                 src = BACKUP_DIR / name
                 if not src.exists():
@@ -454,11 +572,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"success": False, "error": str(exc)}, 400)
 
 
-if __name__ == "__main__":
+def main():
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     if not ADMIN_TOKEN:
         raise SystemExit("TRENDRADAR_ADMIN_TOKEN or TRENDRADAR_ADMIN_TOKEN_FILE is required")
-    host = os.environ.get("TRENDRADAR_ADMIN_HOST", "0.0.0.0")
+    host = os.environ.get("TRENDRADAR_ADMIN_HOST", "127.0.0.1")
     port = int(os.environ.get("TRENDRADAR_ADMIN_PORT", "8081"))
-    print(f"TrendRadar Admin listening on {host}:{port}", flush=True)
+    print(f"TrendRadar Admin listening on {host}:{port} (allowed hosts: {', '.join(sorted(ALLOWED_HOSTS))}; manual run {'enabled' if RUN_ENABLED else 'disabled'})", flush=True)
     ThreadingHTTPServer((host, port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

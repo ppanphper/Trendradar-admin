@@ -9,6 +9,8 @@ services:
       TRENDRADAR_ADMIN_HOST: 0.0.0.0
       TRENDRADAR_ADMIN_PORT: 8081
       TRENDRADAR_ADMIN_TOKEN_FILE: /app/admin/.admin-token
+      TRENDRADAR_ADMIN_ALLOWED_HOSTS: "${TRENDRADAR_ADMIN_ALLOWED_HOSTS:-127.0.0.1,localhost,[::1]}"
+      TRENDRADAR_ADMIN_ENABLE_RUN: "${TRENDRADAR_ADMIN_ENABLE_RUN:-0}"
       TRENDRADAR_BASE_DIR: /app
       TRENDRADAR_CONFIG_DIR: /app/config
       TRENDRADAR_OUTPUT_DIR: /app/output
@@ -19,7 +21,7 @@ services:
       TRENDRADAR_WEB_PUBLIC_URL: "${TRENDRADAR_WEB_PUBLIC_URL:-}"
       TRENDRADAR_ADMIN_PUBLIC_URL: "${TRENDRADAR_ADMIN_PUBLIC_URL:-}"
     ports:
-      - 0.0.0.0:8081:8081
+      - 127.0.0.1:8081:8081
     volumes:
       - ../admin:/app/admin:ro
       - ../docs:/app/docs:ro
