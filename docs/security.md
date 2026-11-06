@@ -23,17 +23,18 @@ and backup restores, a backup before every write, and atomic replacement of conf
 
 ## Editor data integrity
 
-The official editor rewrites `platforms.sources` with only `id` and `name`, silently dropping
-`expected_domain`, which disables TrendRadar's link-domain check. The bridge wraps
-`updatePlatformsInYaml` and writes back every scalar field the platform had before.
+Older versions of the official editor rewrite `platforms.sources` with only `id` and `name`,
+silently dropping `expected_domain`, which disables TrendRadar's link-domain check. The bridge wraps
+`updatePlatformsInYaml` and writes back every scalar field the platform had before; it adds nothing
+when the editor already kept the field.
 
-Known limitations of the official editor, not fixed here:
+The editor itself was fixed in ppanphper/TrendRadar#1 (`docs/assets/yaml-block.js`): list edits keep
+unchanged items verbatim, keep comments and unknown fields, handle block-style standalone lists, and
+remove standalone references to deleted feeds and platforms.
 
-- Editing RSS feeds in the visual panel drops comments inside `rss.feeds`.
-- Deleting an RSS feed leaves its id in `display.standalone.rss_feeds`.
-- The page needs `'unsafe-inline'` scripts because the editor uses inline event handlers, so an
-  HTML injection inside the editor would still run. Config content is rendered with `innerHTML`
-  in places (for example platform names); treat config files from untrusted sources accordingly.
+Remaining limitation: the page needs `'unsafe-inline'` scripts because the editor uses inline event
+handlers, so an HTML injection inside the editor would still run. Treat config files from untrusted
+sources accordingly.
 
 ## Deployment notes
 
