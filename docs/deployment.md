@@ -51,15 +51,15 @@ The script will:
 - generate `/opt/trendradar/admin/.admin-token` if missing;
 - write `/opt/trendradar/docker-compose.admin.yml`;
 - start or recreate `trendradar-admin` unless `--no-start` is passed;
-- print the admin URL and token.
+- print the admin URL and the token file path.
 
 Open the printed URL:
 
 ```text
-http://<server-ip>:8081/?token=<printed-token>
+http://127.0.0.1:8081/
 ```
 
-After login, the token is stored as an `HttpOnly` cookie.
+Paste the token from the token file into the login form. Login creates a server-side session cookie; the token itself is not stored in the browser. To reach the admin from another machine, publish the port on that interface and set `TRENDRADAR_ADMIN_ALLOWED_HOSTS` to the host name you use.
 
 ## Existing Production Layout
 
@@ -67,7 +67,7 @@ For a two-container layout:
 
 ```text
 trendradar       -> 8080, main report site and scheduled runs
-trendradar-admin -> 8081, config admin and manual run endpoint
+trendradar-admin -> 8081, config admin (manual run only with TRENDRADAR_ADMIN_ENABLE_RUN=1)
 ```
 
 Both containers share:
@@ -144,7 +144,7 @@ If `.admin-token` is missing, the installer generates it locally.
 ## Security
 
 - Do not commit `.admin-token`, `.env`, `config/`, `output/`, or generated report files.
-- Keep port `8081` on LAN/VPN or place it behind HTTPS and IP allowlisting.
+- Keep port `8081` on localhost, LAN/VPN, or behind HTTPS and IP allowlisting; see [security.md](security.md).
 - Use `TRENDRADAR_ADMIN_TOKEN_FILE`; avoid putting the token directly in compose environment variables.
 - If the token is missing, `admin_server.py` exits instead of starting without auth.
 
@@ -155,7 +155,7 @@ cd /opt/trendradar
 docker compose -f docker-compose.admin.yml ps
 
 TOKEN=$(cat admin/.admin-token)
-curl -sS -H "Cookie: tr_admin_token=$TOKEN" http://127.0.0.1:8081/api/state | python3 -m json.tool | head
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/state | python3 -m json.tool | head
 ```
 
 Expected:

@@ -66,6 +66,7 @@
       setEditorValue('frequency', state.texts?.frequency || '');
       setEditorValue('timeline', state.texts?.timeline || '');
       updateStatus(state);
+      applyServerFeatures(state);
       toast('已加载服务器配置', 'success');
     } catch (error) {
       toast(`加载失败：${error.message}`, 'error');
@@ -139,6 +140,7 @@
       const state = await api('/run');
       const target = byId('tr-server-run-state');
       if (!target) return;
+      target.hidden = !state.enabled && !state.finished_at;
       target.textContent = state.running
         ? '手动运行中...'
         : state.finished_at
@@ -160,8 +162,97 @@
       <span class="tr-sep"></span>
       <span>最新报告：${reportTime}</span>
       <span class="tr-sep"></span>
-      <span>${(state.files || []).length} 个配置文件</span>
+      <span>${(state.files || []).filter((file) => file.exists).length} 个配置文件</span>
     `;
+  }
+
+  function applyServerFeatures(state) {
+    const runButton = byId('tr-run-now');
+    if (runButton) runButton.hidden = !state.features?.run;
+    const reportLink = byId('tr-report-link');
+    if (reportLink && state.service?.web) {
+      reportLink.href = state.service.web;
+      reportLink.hidden = false;
+    }
+  }
+
+  async function logout() {
+    await fetch('/logout', { method: 'POST' });
+    window.location.reload();
+  }
+
+  // 官方编辑器重写 platforms.sources 时只输出 id 和 name，会丢掉 expected_domain（域名校验）、enabled 等字段。
+  // 在原函数写回后，把每个平台原有的标量字段补回对应条目。
+  const PLATFORM_WRITTEN_KEYS = new Set(['id', 'name']);
+
+  function yamlScalar(value) {
+    if (typeof value === 'string') return JSON.stringify(value);
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    return null;
+  }
+
+  function installPlatformFieldPreservation() {
+    if (window.__trPlatformFieldPreservationInstalled) return;
+    const original = window.updatePlatformsInYaml;
+    if (typeof original !== 'function') return;
+    window.__trPlatformFieldPreservationInstalled = true;
+    window.updatePlatformsInYaml = function preservePlatformFields(platforms) {
+      original.call(this, platforms);
+      restorePlatformFields(platforms);
+    };
+  }
+
+  function restorePlatformFields(platforms) {
+    const editor = byId('yaml-editor');
+    if (!editor) return;
+    const extras = new Map();
+    platforms.forEach((platform) => {
+      const fields = Object.entries(platform || {})
+        .filter(([key]) => !PLATFORM_WRITTEN_KEYS.has(key))
+        .map(([key, value]) => [key, yamlScalar(value)])
+        .filter(([, value]) => value !== null);
+      if (fields.length) extras.set(String(platform.id), fields);
+    });
+    if (!extras.size) return;
+
+    const lines = editor.value.split('\n');
+    const output = [];
+    let inPlatforms = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      output.push(line);
+      if (/^platforms:/.test(line)) {
+        inPlatforms = true;
+        continue;
+      }
+      if (/^[A-Za-z_]+:/.test(line)) inPlatforms = false;
+      if (!inPlatforms) continue;
+
+      const match = line.match(/^(\s*)- id: "(.*)"\s*$/);
+      if (!match || !extras.has(match[2])) continue;
+      const fieldIndent = `${match[1]}  `;
+      const existing = new Set();
+      while (i + 1 < lines.length && lines[i + 1].startsWith(fieldIndent) && !lines[i + 1].trim().startsWith('-')) {
+        i += 1;
+        output.push(lines[i]);
+        existing.add(lines[i].trim().split(':')[0]);
+      }
+      extras.get(match[2])
+        .filter(([key]) => !existing.has(key))
+        .forEach(([key, value]) => output.push(`${fieldIndent}${key}: ${value}`));
+      extras.delete(match[2]);
+    }
+
+    const updated = output.join('\n');
+    if (updated === editor.value) return;
+    editor.value = updated;
+    try {
+      currentYaml = updated; // eslint-disable-line no-undef -- script.js 顶层 let，编辑器各功能从这里读取 YAML
+    } catch (error) {
+      console.warn('无法同步 currentYaml', error);
+    }
+    if (typeof window.updateBackdrop === 'function') window.updateBackdrop('yaml-editor', 'yaml-backdrop');
+    if (typeof window.debounceSaveConfig === 'function') window.debounceSaveConfig();
   }
 
   function setBusy(isBusy, label = '') {
@@ -189,9 +280,6 @@
       privacyHint.innerHTML = '<i class="fa-solid fa-server mr-1.5 text-indigo-500"></i><span>服务器增强模式：配置会保存到当前 TrendRadar 部署</span>';
     }
 
-    const oldActions = nav.querySelector('.flex.gap-3');
-    if (oldActions) oldActions.classList.add('tr-official-actions');
-
     const actions = document.createElement('div');
     actions.id = 'tr-server-actions';
     actions.className = 'tr-server-actions';
@@ -200,8 +288,9 @@
       <button data-tr-server-action class="tr-btn" id="tr-load-server"><i class="fa-solid fa-rotate mr-1"></i>加载服务器配置</button>
       <button data-tr-server-action class="tr-btn tr-primary" id="tr-save-current"><i class="fa-solid fa-floppy-disk mr-1"></i>保存当前</button>
       <button data-tr-server-action class="tr-btn" id="tr-save-all"><i class="fa-solid fa-layer-group mr-1"></i>保存全部</button>
-      <button data-tr-server-action class="tr-btn" id="tr-run-now"><i class="fa-solid fa-play mr-1"></i>立即运行</button>
-      <a class="tr-btn" href="/report" target="_blank"><i class="fa-solid fa-chart-line mr-1"></i>最新报告</a>
+      <button data-tr-server-action class="tr-btn" id="tr-run-now" hidden><i class="fa-solid fa-play mr-1"></i>立即运行</button>
+      <a class="tr-btn" id="tr-report-link" target="_blank" rel="noopener noreferrer" hidden><i class="fa-solid fa-chart-line mr-1"></i>最新报告</a>
+      <button class="tr-btn" id="tr-logout" title="退出登录"><i class="fa-solid fa-right-from-bracket mr-1"></i>退出</button>
     `;
     nav.appendChild(actions);
 
@@ -209,6 +298,7 @@
     byId('tr-save-current').addEventListener('click', saveCurrentToServer);
     byId('tr-save-all').addEventListener('click', saveAllToServer);
     byId('tr-run-now').addEventListener('click', runNow);
+    byId('tr-logout').addEventListener('click', logout);
 
     const runState = document.createElement('div');
     runState.id = 'tr-server-run-state';
@@ -449,7 +539,8 @@
       .tr-btn.tr-primary { background:#4f46e5; color:#fff; border-color:#4f46e5; box-shadow:0 6px 16px rgba(79,70,229,.2); }
       .tr-btn.tr-primary:hover { background:#4338ca; color:#fff; }
       .tr-btn:disabled { opacity:.6; cursor:not-allowed; }
-      .tr-official-actions { display:none !important; }
+      button[onclick^="openLoadConfigModal"], button[onclick^="copyResult"] { display:none !important; }
+      #tr-server-actions [hidden], .tr-run-state[hidden] { display:none !important; }
       .tr-run-state { position:fixed; right:18px; bottom:18px; z-index:50; background:#0f172a; color:#e2e8f0; border-radius:12px; padding:8px 11px; font-size:12px; box-shadow:0 12px 28px rgba(15,23,42,.25); pointer-events:none; }
       .tr-source-lock { border:1px solid #3f3f46; background:#18181b; color:#d4d4d8; border-radius:7px; padding:5px 9px; margin-left:8px; font-size:11px; font-weight:700; line-height:1; transition:.15s ease; white-space:nowrap; }
       .tr-source-lock:hover { background:#27272a; color:#fff; border-color:#6366f1; }
@@ -472,6 +563,7 @@
     installSourceEditorLock();
     installLinkedModuleNavigation();
     setTimeout(installLinkedModuleNavigation, 500);
+    installPlatformFieldPreservation();
     installChineseVisualLabels();
     setTimeout(loadServerConfig, 250);
     refreshRunState();

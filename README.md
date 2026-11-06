@@ -4,9 +4,11 @@ Server-backed admin layer for [TrendRadar](https://github.com/sansan0/TrendRadar
 
 It reuses TrendRadar's official visual config editor, adds authenticated server-side save/run APIs, and writes directly to the same `config/` and `output/` volumes used by the main TrendRadar container.
 
+This fork hardens the admin for a localhost deployment: session login, same-origin checks against CSRF, a Host allowlist, locally vendored editor assets behind a strict CSP, and a fix for the official editor dropping `expected_domain` when platforms are edited. See [docs/security.md](docs/security.md).
+
 ## Features
 
-- Token-protected admin UI on port `8081`.
+- Token-protected admin UI on port `8081`, bound to `127.0.0.1` by default.
 - Loads the local official TrendRadar editor from `docs/index.html`.
 - Saves real server files instead of browser-local storage:
   - `config/config.yaml`
@@ -15,8 +17,9 @@ It reuses TrendRadar's official visual config editor, adds authenticated server-
   - optional AI prompt/interest files.
 - Validates YAML before writes.
 - Creates timestamped backups under `config/backups/` before writes/restores.
-- Can trigger a manual `python -m trendradar` run without restarting the main TrendRadar container.
+- Can trigger a manual `python -m trendradar` run without restarting the main TrendRadar container (opt-in via `TRENDRADAR_ADMIN_ENABLE_RUN=1`).
 - Removes official static-editor actions that are unsafe for server mode, such as loading remote defaults or copying local-only config.
+- Keeps every platform field (`expected_domain`, `enabled`, ...) when platforms are deleted or reordered in the visual editor.
 - Synchronizes module navigation: clicking a config module number jumps both the YAML editor and the visual module card.
 
 ## Layout
@@ -85,18 +88,14 @@ Example service:
 docker compose -f deploy/docker-compose.admin.yml up -d
 ```
 
-Then open:
+Then open `http://127.0.0.1:8081/` and paste the contents of `admin/.admin-token` into the login form.
 
-```text
-http://<host>:8081/?token=<contents-of-admin/.admin-token>
-```
-
-The token is set as an `HttpOnly` cookie and subsequent API calls use that cookie.
+A successful login creates a server-side session (`HttpOnly`, `SameSite=Strict`, 12 hours by default); the token itself is never stored in the cookie. Scripts can call the API with `Authorization: Bearer <token>`.
 
 ## Security Notes
 
 - Do not commit `.admin-token`, `.env`, generated configs, or output reports.
-- Keep `8081` on a trusted network, VPN, or reverse proxy with HTTPS if exposed beyond LAN.
+- Keep `8081` on a trusted network, VPN, or reverse proxy with HTTPS if exposed beyond LAN, and add the host name to `TRENDRADAR_ADMIN_ALLOWED_HOSTS`.
 - The admin process needs write access to `config/` because it edits live TrendRadar configuration. The main TrendRadar service can keep `config/` read-only.
 - If `TRENDRADAR_ADMIN_TOKEN` or `TRENDRADAR_ADMIN_TOKEN_FILE` is missing, the server fails closed and exits.
 
@@ -115,8 +114,11 @@ TRENDRADAR_ADMIN_DIR=/app/admin
 Useful optional variables:
 
 ```text
-TRENDRADAR_ADMIN_HOST=0.0.0.0
+TRENDRADAR_ADMIN_HOST=127.0.0.1          # use 0.0.0.0 inside a container and bind the published port to 127.0.0.1
 TRENDRADAR_ADMIN_PORT=8081
+TRENDRADAR_ADMIN_ALLOWED_HOSTS=127.0.0.1,localhost,[::1]   # Host header allowlist (DNS rebinding); * disables it
+TRENDRADAR_ADMIN_SESSION_TTL=43200       # seconds
+TRENDRADAR_ADMIN_ENABLE_RUN=0            # 1 enables the manual run button and POST /api/run
 TRENDRADAR_RUN_TIMEOUT=900
 TRENDRADAR_WEB_PORT=8080
 TRENDRADAR_WEB_PUBLIC_URL=https://trendradar.example.com/
@@ -128,5 +130,7 @@ If public URL variables are omitted, the admin API infers display URLs from the 
 ## Local Check
 
 ```bash
-python3 -m py_compile admin/admin_server.py
+python3 -m unittest discover -s tests
 ```
+
+`tests/e2e/editor_check.mjs` drives the real editor in headless Chrome against a running admin (CSP violations, hidden buttons, platform field preservation). Rerun it after upstream editor updates.

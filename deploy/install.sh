@@ -11,7 +11,7 @@ Usage:
 Environment overrides:
   TRENDRADAR_DIR=/opt/trendradar
   TRENDRADAR_IMAGE=local/trendradar:6.10.0
-  ADMIN_HOST=0.0.0.0
+  ADMIN_HOST=127.0.0.1
   ADMIN_PORT=8081
   TRENDRADAR_RUN_TIMEOUT=900
   TRENDRADAR_WEB_PUBLIC_URL=
@@ -34,7 +34,9 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 TRENDRADAR_DIR="${TRENDRADAR_DIR:-/opt/trendradar}"
 TRENDRADAR_IMAGE="${TRENDRADAR_IMAGE:-local/trendradar:6.10.0}"
-ADMIN_HOST="${ADMIN_HOST:-0.0.0.0}"
+ADMIN_HOST="${ADMIN_HOST:-127.0.0.1}"
+TRENDRADAR_ADMIN_ALLOWED_HOSTS="${TRENDRADAR_ADMIN_ALLOWED_HOSTS:-127.0.0.1,localhost,[::1]}"
+TRENDRADAR_ADMIN_ENABLE_RUN="${TRENDRADAR_ADMIN_ENABLE_RUN:-0}"
 ADMIN_PORT="${ADMIN_PORT:-8081}"
 TRENDRADAR_RUN_TIMEOUT="${TRENDRADAR_RUN_TIMEOUT:-900}"
 TRENDRADAR_WEB_PUBLIC_URL="${TRENDRADAR_WEB_PUBLIC_URL:-}"
@@ -134,6 +136,8 @@ fi
 mkdir -p "$TRENDRADAR_DIR/admin"
 install -m 0755 "$REPO_ROOT/admin/admin_server.py" "$TRENDRADAR_DIR/admin/admin_server.py"
 install -m 0644 "$REPO_ROOT/admin/admin_bridge.js" "$TRENDRADAR_DIR/admin/admin_bridge.js"
+rm -rf "$TRENDRADAR_DIR/admin/vendor"
+cp -R "$REPO_ROOT/admin/vendor" "$TRENDRADAR_DIR/admin/vendor"
 
 if [ ! -s "$TRENDRADAR_DIR/admin/.admin-token" ]; then
   if command -v openssl >/dev/null 2>&1; then
@@ -161,6 +165,8 @@ services:
       TRENDRADAR_ADMIN_HOST: 0.0.0.0
       TRENDRADAR_ADMIN_PORT: 8081
       TRENDRADAR_ADMIN_TOKEN_FILE: /app/admin/.admin-token
+      TRENDRADAR_ADMIN_ALLOWED_HOSTS: "${TRENDRADAR_ADMIN_ALLOWED_HOSTS}"
+      TRENDRADAR_ADMIN_ENABLE_RUN: "${TRENDRADAR_ADMIN_ENABLE_RUN}"
       TRENDRADAR_BASE_DIR: /app
       TRENDRADAR_CONFIG_DIR: /app/config
       TRENDRADAR_OUTPUT_DIR: /app/output
@@ -187,7 +193,6 @@ if [ "$START_ADMIN" = "1" ]; then
   fi
 fi
 
-token="$(cat "$TRENDRADAR_DIR/admin/.admin-token")"
 host_for_url="$ADMIN_HOST"
 if [ "$host_for_url" = "0.0.0.0" ]; then
   host_for_url="<server-ip>"
@@ -202,7 +207,9 @@ Compose: $TRENDRADAR_DIR/docker-compose.admin.yml
 Token file: $TRENDRADAR_DIR/admin/.admin-token
 
 Open:
-  http://${host_for_url}:${ADMIN_PORT}/?token=${token}
+  http://${host_for_url}:${ADMIN_PORT}/
+and paste the token from:
+  $TRENDRADAR_DIR/admin/.admin-token
 
 Keep the token private. It is not stored in this repository.
 EOF
